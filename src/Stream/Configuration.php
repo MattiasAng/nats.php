@@ -85,7 +85,7 @@ class Configuration
             $config->setMaxMessagesPerSubject($object->max_msgs_per_subject);
         }
 
-        if (isset($object->consumer_limits)) {
+        if (!empty($object->consumer_limits)) {
             $config->setConsumerLimits((array) $object->consumer_limits);
         }
 
@@ -298,7 +298,6 @@ class Configuration
             'retention' => $this->getRetentionPolicy(),
             'storage' => $this->getStorageBackend(),
             'subjects' => $this->getSubjects(),
-            'consumer_limits' => $this->getConsumerLimits(),
             'allow_msg_schedules' => $this->getAllowMsgSchedules(),
         ];
 
@@ -306,6 +305,10 @@ class Configuration
             if ($v === null) {
                 unset($config[$k]);
             }
+        }
+
+        if (!empty($this->getConsumerLimits())) {
+            $config['consumer_limits'] = $this->getConsumerLimits();
         }
 
         return $config;

@@ -734,4 +734,37 @@ class StreamTest extends FunctionalTestCase
             $this->assertEquals('408', $last->payload->getHeader('Status-Code'), 'Last message should be 408 for legacy nats installations');
         }
     }
+
+    /**
+     * Reproduces https://github.com/basis-company/nats.php/issues/140
+     *
+     * The server always responds to STREAM.INFO with "consumer_limits": {}
+     * (go omitempty does not work on structs). It is turned into an empty php
+     * array by Configuration::fromObject(), so a following STREAM.UPDATE
+     * sends "consumer_limits":[] and the server rejects it with error 10025:
+     * invalid JSON: json: cannot unmarshal array into Go struct field
+     * StreamConfigRequest.StreamConfig.consumer_limits of type server.StreamConsumerLimits
+     */
+    public function testUpdatePersistedStreamWithoutConsumerLimits(): void
+    {
+        $api = $this->getClient()->getApi();
+
+        $stream = $api->getStream('issue_140_stream');
+        $stream->getConfiguration()->setSubjects(['tester.greet']);
+        $stream->create();
+
+        // fresh client behaves like a new process (symfony/messenger setup step):
+        // the configuration is loaded from the server for the persisted stream
+        $this->getClient()->disconnect();
+        $this->client = $this->createClient();
+
+        $stream = $this->getClient()->getApi()->getStream('issue_140_stream');
+
+        $this->assertTrue($stream->exists());
+
+        // must not throw error 10025 invalid JSON
+        $stream->update();
+
+        $this->assertTrue($stream->exists());
+    }
 }

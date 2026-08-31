@@ -6,5 +6,6 @@ vendor
 # Editor files
 *.bak
 .idea
+.omo
 .php-cs-fixer.cache
 phpunit.xml
