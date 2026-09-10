@@ -1,0 +1,282 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Tests\Functional;
+
+use Basis\Nats\Client;
+use Basis\Nats\Connection;
+use ReflectionProperty;
+use Tests\FunctionalTestCase;
+
+/**
+ * Exercises discovery and failover against the three node cluster in
+ * docker/docker-compose.yml. Each node advertises a client_advertise address that
+ * is reachable from here, which is what makes connect_urls usable at all.
+ */
+class ClusterTest extends FunctionalTestCase
+{
+    /** Cached so only the first test pays for waiting on a cluster that is absent. */
+    private static ?string $unavailable = null;
+    private static bool $checked = false;
+
+    private const NODES = [
+        1 => ['client' => '127.0.0.1:4231', 'monitor' => 8231],
+        2 => ['client' => '127.0.0.1:4232', 'monitor' => 8232],
+        3 => ['client' => '127.0.0.1:4233', 'monitor' => 8233],
+    ];
+
+    public function setUp(): void
+    {
+        parent::setUp();
+
+        $this->awaitCluster();
+    }
+
+    public function testTopologyIsDiscovered(): void
+    {
+        $client = $this->clusterClient([self::NODES[1]['client']]);
+        $client->ping();
+
+        $discovered = $this->awaitDiscovery($client, 2);
+
+        $this->assertContains('nats://' . self::NODES[2]['client'], $discovered);
+        $this->assertContains('nats://' . self::NODES[3]['client'], $discovered);
+        $this->assertCount(3, $client->getServers(), 'one entry per node');
+    }
+
+    /**
+     * An assembled cluster advertises itself in the INFO that opens the connection,
+     * so the pool is already complete by the time the client is connected and there
+     * is no discovery to report. The go and python clients both suppress the
+     * notification for that first message, and python pins this exact case.
+     *
+     * The notification for a node that joins later is covered without a cluster in
+     * Tests\Unit\AsyncInfoTest.
+     */
+    public function testAnAssembledClusterReportsNoDiscovery(): void
+    {
+        $calls = 0;
+        $client = $this->clusterClient(
+            [self::NODES[1]['client']],
+            ['discoveredServersHandler' => function () use (&$calls) {
+                $calls++;
+            }]
+        );
+        $client->ping();
+        $client->process(0.3);
+
+        $this->assertCount(3, $client->getServers(), 'the pool is filled during the handshake');
+        $this->assertSame(0, $calls);
+    }
+
+    /**
+     * A configured host name is not resolved before being compared, so it does not
+     * match the address the cluster advertises for that same node and both end up
+     * in the pool. The go client behaves the same way; resolving would be wrong,
+     * since a name can stand for several addresses.
+     */
+    public function testAHostNameDoesNotMatchAnAdvertisedAddress(): void
+    {
+        $client = $this->clusterClient(['localhost:4231']);
+        $client->ping();
+
+        $this->awaitDiscovery($client, 3);
+
+        $this->assertContains('nats://localhost:4231', $client->getServers());
+        $this->assertContains('nats://127.0.0.1:4231', $client->getServers());
+        $this->assertCount(4, $client->getServers(), 'node one is present under both names');
+    }
+
+    /**
+     * The point of discovery: a client configured with one node can fail over onto
+     * a node it was never told about.
+     */
+    public function testFailoverOntoADiscoveredNode(): void
+    {
+        $client = $this->clusterClient([self::NODES[1]['client']]);
+        $client->ping();
+        $this->awaitDiscovery($client, 2);
+
+        $socket = new ReflectionProperty(Connection::class, 'socket');
+        fclose($socket->getValue($client->connection));
+
+        $this->assertTrue($client->ping());
+
+        $addresses = array_column(self::NODES, 'client');
+        $this->assertContains($client->connection->getPool()->current()->getAddress(), $addresses);
+    }
+
+    /**
+     * Messages still reach a subscriber on another node after the publisher has
+     * been forced onto a different one, which is what makes the failover useful
+     * rather than merely successful.
+     */
+    public function testMessagesStillRouteAfterFailover(): void
+    {
+        $subject = 'cluster.' . bin2hex(random_bytes(4));
+
+        $subscriber = $this->clusterClient([self::NODES[2]['client']]);
+        $received = [];
+        $subscriber->subscribe($subject, function ($message) use (&$received) {
+            $received[] = (string) $message;
+        });
+        $subscriber->process(1);
+
+        $publisher = $this->clusterClient([self::NODES[1]['client']]);
+        $publisher->ping();
+        $this->awaitDiscovery($publisher, 2);
+
+        $publisher->forceReconnect();
+        $publisher->publish($subject, 'after failover');
+
+        $threshold = microtime(true) + 3;
+        while ($received === [] && microtime(true) < $threshold) {
+            $subscriber->process(0.1);
+        }
+
+        $this->assertSame(['after failover'], $received);
+
+        $subscriber->disconnect();
+        $publisher->disconnect();
+    }
+
+    /**
+     * Node three is signalled into lame duck mode, which makes it announce the
+     * transition and then drain its clients. It is restarted afterwards, so this
+     * test owns that node.
+     */
+    public function testLameDuckModeIsAnnouncedByTheServer(): void
+    {
+        if (!$this->dockerAvailable()) {
+            $this->markTestSkipped('docker compose is needed to signal a server into lame duck mode');
+        }
+
+        $notified = [];
+        $client = $this->clusterClient(
+            [self::NODES[3]['client']],
+            ['lameDuckModeHandler' => function (Client $client) use (&$notified) {
+                $notified[] = $client->connection->getPool()->current()->getAddress();
+            }]
+        );
+        $client->ping();
+
+        $this->signalLameDuckMode(3);
+
+        $threshold = microtime(true) + 10;
+        while ($notified === [] && microtime(true) < $threshold) {
+            try {
+                $client->process(0.2);
+            } catch (\Throwable) {
+                // The server drains the connection once it is in lame duck mode.
+                break;
+            }
+        }
+
+        $this->assertSame([self::NODES[3]['client']], $notified);
+    }
+
+    public function tearDown(): void
+    {
+        // The inherited teardown deletes every stream on the default server, which
+        // has nothing to do with the cluster these tests use.
+    }
+
+    private function clusterClient(array $servers, array $options = []): Client
+    {
+        return $this->createClient($options + [
+            'servers' => $servers,
+            'noRandomize' => true,
+            'reconnectWait' => 0.0,
+            'reconnectJitter' => 0.0,
+        ]);
+    }
+
+    /**
+     * Discovery arrives on an asynchronous INFO some time after the connection is
+     * up, so the pool has to be given a chance to fill rather than read at once.
+     *
+     * @return string[]
+     */
+    private function awaitDiscovery(Client $client, int $expected): array
+    {
+        $threshold = microtime(true) + 5;
+
+        while (microtime(true) < $threshold) {
+            if (count($client->getDiscoveredServers()) >= $expected) {
+                break;
+            }
+            $client->process(0.1);
+        }
+
+        return $client->getDiscoveredServers();
+    }
+
+    /**
+     * Waits for every node to be up and routed to the others.
+     *
+     * `docker compose up -d` returns once the containers have started, not once
+     * they are ready, and a three node mesh takes appreciably longer to form than a
+     * single server takes to boot. Waiting rather than skipping outright keeps this
+     * from quietly passing on a machine where the cluster was merely slow.
+     */
+    private function awaitCluster(): void
+    {
+        if (self::$checked) {
+            if (self::$unavailable !== null) {
+                $this->markTestSkipped(self::$unavailable);
+            }
+
+            return;
+        }
+
+        self::$checked = true;
+        $threshold = microtime(true) + 30;
+        $routes = [];
+
+        while (microtime(true) < $threshold) {
+            $routes = [];
+
+            foreach (self::NODES as $number => $node) {
+                $varz = @file_get_contents("http://127.0.0.1:{$node['monitor']}/varz");
+                $routes[$number] = is_string($varz) ? (json_decode($varz, true)['routes'] ?? 0) : 0;
+            }
+
+            if (min($routes) >= 2) {
+                return;
+            }
+
+            usleep(250_000);
+        }
+
+        self::$unavailable = 'The cluster is not available (routes per node: '
+            . json_encode($routes) . '). Start it with: docker compose up -d in docker/';
+
+        $this->markTestSkipped(self::$unavailable);
+    }
+
+    private function dockerAvailable(): bool
+    {
+        exec('docker compose version 2>/dev/null', $output, $status);
+
+        return $status === 0;
+    }
+
+    private function signalLameDuckMode(int $node): void
+    {
+        $directory = escapeshellarg($this->getProjectRoot() . '/docker');
+        $service = escapeshellarg("nats-cluster-$node");
+
+        exec("docker compose --project-directory $directory kill -s SIGUSR2 $service 2>&1", $output, $status);
+
+        if ($status !== 0) {
+            $this->markTestSkipped('Could not signal the server: ' . implode("\n", $output));
+        }
+
+        // Restored for the rest of the suite: a server stays in lame duck mode until
+        // it is restarted, and stops accepting connections while it is.
+        register_shutdown_function(static function () use ($directory, $service) {
+            exec("docker compose --project-directory $directory restart $service 2>&1");
+        });
+    }
+}
