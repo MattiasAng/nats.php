@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Basis\Nats;
 
+use Basis\Nats\Connection\Server;
+use Basis\Nats\Connection\ServerPool;
 use Basis\Nats\Message\Connect;
 use Basis\Nats\Message\Factory;
 use Basis\Nats\Message\Info;
@@ -46,10 +48,20 @@ class Connection
     private float $prolongateTill = 0;
     private int $packetSize = 1024;
 
+    /** True once TLS has been negotiated on the current socket. */
+    private bool $tlsEnabled = false;
+
     private ?Authenticator $authenticator;
     private Configuration $config;
     private Connect $connectMessage;
     private Info $infoMessage;
+
+    /**
+     * Built on first use rather than in the constructor, so that configuration
+     * changed after the client was created is still picked up, and so that merely
+     * creating a client never resolves an address.
+     */
+    private ?ServerPool $pool = null;
 
     public function __construct(
         private Client $client,
@@ -69,6 +81,23 @@ class Connection
         return $this->infoMessage;
     }
 
+    public function getPool(): ServerPool
+    {
+        return $this->pool ??= new ServerPool($this->config);
+    }
+
+    /** @return string[] every server the client may use, without credentials */
+    public function getServers(): array
+    {
+        return $this->getPool()->getServers();
+    }
+
+    /** @return string[] only the servers learned from the cluster */
+    public function getDiscoveredServers(): array
+    {
+        return $this->getPool()->getDiscoveredServers();
+    }
+
     public function getMessage(null|int|float $timeout = 0): ?Message
     {
         // null means use config timeout, 0 means non-blocking check
@@ -82,6 +111,10 @@ class Connection
 
         while (true) {
             if (!is_resource($this->socket) || feof($this->socket)) {
+                // Either reconnected onto a fresh socket or rethrown. Deliberately
+                // falls through to the select below rather than looping back: a
+                // socket that came back still unusable would spin here forever,
+                // since a zero timeout only breaks out at the select.
                 $this->processException(new LogicException('supplied resource is not a valid stream resource'));
             }
 
@@ -137,11 +170,17 @@ class Connection
                     $this->pongAt = $now;
                     return $message;
                 } elseif ($message instanceof Info) {
-                    if (isset($message->tls_verify) && $message->tls_verify && !$this->config->tlsHandshakeFirst) {
-                        $this->enableTls(true);
-                    } elseif (isset($message->tls_required) && $message->tls_required && !$this->config->tlsHandshakeFirst) {
-                        $this->enableTls(false);
+                    // Asynchronous updates repeat the tls flags, so without this
+                    // guard an already encrypted socket is handed to
+                    // stream_socket_enable_crypto a second time.
+                    if (!$this->tlsEnabled && !$this->config->tlsHandshakeFirst) {
+                        if (isset($message->tls_verify) && $message->tls_verify) {
+                            $this->enableTls(true);
+                        } elseif (isset($message->tls_required) && $message->tls_required) {
+                            $this->enableTls(false);
+                        }
                     }
+                    $this->processInfo($message);
                     return $message;
                 }
             } elseif ($this->activityAt && $this->activityAt + $this->config->timeout < $now) {
@@ -224,27 +263,106 @@ class Connection
             return;
         }
 
-        // The handshake writes through sendMessage() and reads through
-        // getMessage(), both of which recover from failures by reconnecting. Left
-        // unguarded that recursion connects to another server, completes its
-        // handshake, and then unwinds back into this one, which carries on against
-        // a socket that is already connected and authenticated somewhere else.
-        $this->connecting = true;
+        // One pass over the pool, then give up: an initial connection reports that
+        // it could not be made rather than blocking indefinitely.
+        $this->connect(retry: false);
+    }
 
-        try {
-            $this->handshake();
-        } finally {
-            $this->connecting = false;
+    /**
+     * Establishes a connection, trying the servers in the pool in turn.
+     *
+     * @param bool $retry whether to keep sweeping the pool, backing off between
+     *                    sweeps, or to give up once every server has been tried
+     */
+    private function connect(bool $retry): void
+    {
+        $pool = $this->getPool();
+        $remaining = $pool->count();
+        $failure = null;
+
+        while (true) {
+            $server = $pool->current();
+
+            if ($server === null) {
+                throw $failure ?? new Exception('No servers available');
+            }
+
+            $this->closeSocket();
+
+            try {
+                // The handshake writes through sendMessage() and reads through
+                // getMessage(), both of which recover from failure by reconnecting.
+                // Left unguarded that recursion connects to another server,
+                // completes its handshake, and then unwinds back into this one,
+                // which carries on against a socket already connected elsewhere.
+                $this->connecting = true;
+
+                try {
+                    $this->handshake($server);
+                } finally {
+                    $this->connecting = false;
+                }
+
+                return;
+            } catch (Throwable $error) {
+                $failure = $error;
+                $pool->markFailed($server, $error);
+
+                // Rejected credentials will not start working on their own, so a
+                // server failing that way twice running is dropped rather than
+                // retried around the pool forever.
+                if ($this->isAuthenticationFailure($error)) {
+                    if ($server->authenticationFailed) {
+                        $pool->evict($server);
+                    }
+                    $server->authenticationFailed = true;
+                }
+            }
+
+            // Retires servers that used up their budget, and throws once the pool
+            // has nothing left to offer.
+            try {
+                $pool->next();
+            } catch (Throwable) {
+                throw $failure;
+            }
+
+            if (--$remaining > 0) {
+                continue;
+            }
+
+            if (!$retry) {
+                throw $failure;
+            }
+
+            // Backing off once per sweep rather than between servers, as the go
+            // client does, so a healthy peer is reached without an artificial delay
+            // while a cluster that is entirely down is still not hammered.
+            $this->wait();
+            $remaining = $pool->count();
         }
     }
 
-    private function handshake(): void
+    private function handshake(Server $server): void
     {
         $config = $this->config;
-        $dsn = "$config->host:$config->port";
+
+        // Timestamps and the tls flag describe one socket. Carried into the next
+        // connection they either skip the tls handshake, sending a cleartext CONNECT
+        // to a tls port, or make the liveness check fire immediately and reconnect
+        // in a loop.
+        $this->resetConnectionState();
+
         $flags = STREAM_CLIENT_CONNECT;
         $this->context = stream_context_create();
-        $this->socket = @stream_socket_client($dsn, $error, $errorMessage, $config->timeout, $flags, $this->context);
+        $this->socket = @stream_socket_client(
+            $server->getDsn(),
+            $error,
+            $errorMessage,
+            $config->timeout,
+            $flags,
+            $this->context
+        );
 
         if ($error || !$this->socket) {
             throw new Exception($errorMessage ?: "Connection error", $error);
@@ -257,6 +375,7 @@ class Connection
         }
 
         $this->connectMessage = new Connect($config->getOptions());
+        $this->applyCredentials($server, $this->connectMessage);
 
         if ($this->client->getName()) {
             $this->connectMessage->name = $this->client->getName();
@@ -278,7 +397,67 @@ class Connection
 
         $this->sendMessage($this->connectMessage);
 
+        $this->verifyConnection();
+
+        $this->getPool()->markConnected($server);
+
         $this->restoreSubscriptions();
+    }
+
+    /**
+     * Confirms the server accepted the connection.
+     *
+     * Credentials are rejected asynchronously: the server takes the CONNECT bytes
+     * and only afterwards answers -ERR and hangs up. Treating a successful write as
+     * success would reset the server's reconnect budget on every attempt, so a node
+     * that always rejects us is never retired from the pool, and the -ERR would
+     * surface out of whichever unrelated read happened to come next. A PING round
+     * trip brings the rejection here, where the caller can act on it.
+     */
+    private function verifyConnection(): void
+    {
+        $this->writeMessage(new Ping());
+        $this->pingAt = microtime(true);
+
+        if (!$this->getMessage($this->config->timeout) instanceof Pong) {
+            throw new Exception('Handshake failed: no PONG received');
+        }
+    }
+
+    /**
+     * Credentials carried by a server url take precedence over the configured ones,
+     * the precedence the go client uses, and the three forms stay mutually
+     * exclusive. nkey and jwt are untouched: they are signed per connection from the
+     * nonce in that server's INFO, so they already apply to every server.
+     */
+    private function applyCredentials(Server $server, Connect $message): void
+    {
+        if ($server->token !== null) {
+            unset($message->user, $message->pass);
+            $message->auth_token = $server->token;
+
+            return;
+        }
+
+        if ($server->user !== null) {
+            unset($message->auth_token);
+            $message->user = $server->user;
+
+            if ($server->pass !== null) {
+                $message->pass = $server->pass;
+            } else {
+                unset($message->pass);
+            }
+        }
+    }
+
+    private function resetConnectionState(): void
+    {
+        $this->tlsEnabled = false;
+        $this->activityAt = 0;
+        $this->pingAt = 0;
+        $this->pongAt = 0;
+        $this->prolongateTill = 0;
     }
 
     /**
@@ -335,6 +514,41 @@ class Connection
 
         if (!stream_socket_enable_crypto($this->socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT)) {
             throw new Exception('Failed to connect: Error enabling TLS');
+        }
+
+        $this->tlsEnabled = true;
+    }
+
+    /**
+     * Applies an INFO message: the cluster topology it advertises, and the fields it
+     * refreshes on the connection.
+     */
+    private function processInfo(Info $info): void
+    {
+        // During the handshake the message is assigned wholesale by handshake()
+        // itself, against a connection that has no previous state to keep.
+        if (!$this->connecting) {
+            $this->mergeInfoMessage($info);
+        }
+
+        $this->getPool()->processInfo($info, $this->connecting);
+    }
+
+    /**
+     * Merged rather than replaced, because an asynchronous INFO carries only some of
+     * the fields. Replacing would turn a property that callers read directly, such
+     * as tls_required, back into an uninitialized one, and reading that is an Error.
+     */
+    private function mergeInfoMessage(Info $info): void
+    {
+        if (!isset($this->infoMessage)) {
+            $this->infoMessage = $info;
+
+            return;
+        }
+
+        foreach (get_object_vars($info) as $property => $value) {
+            $this->infoMessage->$property = $value;
         }
     }
 
@@ -441,32 +655,59 @@ class Connection
             throw $e;
         }
 
-        $maxAttempts = $this->config->maxReconnectAttempts;
-        $iteration = 0;
+        $pool = $this->getPool();
 
-        while (true) {
-            if ($maxAttempts >= 0 && $iteration >= $maxAttempts) {
-                // reconnect attempts exhausted: rethrow the last connection error
-                throw $e;
-            }
-            if ($iteration > 0) {
-                $this->config->delay($iteration - 1);
-            }
-            try {
-                // Explicitly close the old socket, otherwise every reconnection
-                // leaks its file descriptor and the process eventually
-                // crosses PHP's FD_SETSIZE limit (1024) see #139
-                if (is_resource($this->socket)) {
-                    fclose($this->socket);
-                }
-                $this->socket = null;
-                $this->init();
-            } catch (Throwable $e) {
-                $iteration++;
-                continue;
-            }
-            break;
+        // Move off the server that just dropped us before trying anything. On a
+        // single server pool this comes back round to the same one.
+        try {
+            $pool->next();
+        } catch (Throwable) {
+            throw $e;
         }
+
+        try {
+            $this->connect(retry: true);
+        } catch (Throwable) {
+            // Report the disconnect that started this rather than the last failed
+            // attempt to recover from it.
+            throw $e;
+        }
+    }
+
+    private function isAuthenticationFailure(Throwable $e): bool
+    {
+        $message = strtolower($e->getMessage());
+
+        return str_contains($message, 'authorization violation')
+            || str_contains($message, 'authentication expired')
+            || str_contains($message, 'authentication timeout');
+    }
+
+    /** Backs off before sweeping the pool again, jittered to spread a fleet out. */
+    private function wait(): void
+    {
+        $seconds = $this->config->reconnectWait;
+
+        if ($this->config->reconnectJitter > 0) {
+            $seconds += mt_rand(0, (int) ($this->config->reconnectJitter * 1_000_000)) / 1_000_000;
+        }
+
+        if ($seconds > 0) {
+            usleep((int) ($seconds * 1_000_000));
+        }
+    }
+
+    /**
+     * Closed explicitly: otherwise every reconnection leaks the old descriptor and
+     * the process eventually crosses PHP's FD_SETSIZE limit, see #139.
+     */
+    private function closeSocket(): void
+    {
+        if (is_resource($this->socket)) {
+            fclose($this->socket);
+        }
+
+        $this->socket = null;
     }
 
     public function setPacketSize(int $size): void
@@ -476,9 +717,7 @@ class Connection
 
     public function close(): void
     {
-        if ($this->socket) {
-            fclose($this->socket);
-            $this->socket = null;
-        }
+        $this->closeSocket();
+        $this->resetConnectionState();
     }
 }

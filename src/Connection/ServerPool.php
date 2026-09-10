@@ -111,6 +111,24 @@ class ServerPool
         $server->reconnects = 0;
         $server->lastError = null;
         $server->draining = false;
+        $server->authenticationFailed = false;
+    }
+
+    /**
+     * Drops a server for good, for failures that retrying cannot resolve.
+     */
+    public function evict(Server $server): void
+    {
+        foreach ($this->servers as $index => $candidate) {
+            if ($candidate === $server) {
+                array_splice($this->servers, $index, 1);
+                break;
+            }
+        }
+
+        if ($this->current === $server) {
+            $this->current = $this->servers[0] ?? null;
+        }
     }
 
     public function markFailed(Server $server, Throwable $error): void

@@ -28,6 +28,9 @@ class Server
     /** Set when the server told us it entered lame duck mode. */
     public bool $draining = false;
 
+    /** Set when this server rejected our credentials on the last attempt. */
+    public bool $authenticationFailed = false;
+
     public function __construct(
         public readonly string $host,
         public readonly int $port,
