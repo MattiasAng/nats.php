@@ -24,6 +24,15 @@ abstract class Prototype
 
         $values = is_array($payload) ? $payload : $payload->getValues();
         if ($values === null) {
+            // A non-empty body that does not decode means the line was damaged, most
+            // often a protocol line truncated mid-json. Returning silently here leaves
+            // every property uninitialized while the message still passes an
+            // instanceof check, so the failure surfaces much later and far away.
+            if ($payload instanceof Payload && !$payload->isEmpty()) {
+                throw new InvalidArgumentException(
+                    'Invalid payload for message ' . get_class($this) . ': ' . $payload->body
+                );
+            }
             return;
         }
 

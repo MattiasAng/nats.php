@@ -21,6 +21,19 @@ use Exception;
 
 class Connection
 {
+    /**
+     * Unit of a single protocol line read. stream_get_line() stops after this many
+     * bytes without consuming the delimiter, so readLine() keeps reading until a
+     * short chunk comes back.
+     */
+    private const CONTROL_LINE_CHUNK = 1024;
+
+    /** Refuse to buffer a single protocol line larger than this. */
+    private const CONTROL_LINE_LIMIT = 1_048_576;
+
+    /** How many times to wait for the rest of a partially consumed protocol line. */
+    private const CONTROL_LINE_RETRIES = 16;
+
     private $socket;
     private $context;
 
@@ -100,7 +113,7 @@ class Connection
             }
 
             $message = null;
-            $line = stream_get_line($this->socket, 1024, "\r\n");
+            $line = $this->readLine();
             $now = microtime(true);
             if ($line) {
                 $message = Factory::create($line);
@@ -292,6 +305,55 @@ class Connection
 
         if (!stream_socket_enable_crypto($this->socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT)) {
             throw new Exception('Failed to connect: Error enabling TLS');
+        }
+    }
+
+    /**
+     * Reads a single protocol control line.
+     *
+     * A clustered INFO carrying many connect_urls comfortably exceeds one chunk.
+     * stream_get_line() returns exactly the chunk size in that case and leaves the
+     * delimiter unconsumed, handing back the remainder of the same line on the next
+     * call as though it were a new protocol line. Reading a truncated INFO leaves the
+     * json_decode in Payload returning null, which Prototype used to swallow, and the
+     * leftovers then reach Factory as garbage.
+     *
+     * @return string|false false when nothing was read at all
+     */
+    private function readLine(): string|false
+    {
+        $line = '';
+        $iteration = 0;
+
+        while (true) {
+            $chunk = stream_get_line($this->socket, self::CONTROL_LINE_CHUNK, "\r\n");
+
+            if ($chunk === false) {
+                if ($line === '') {
+                    // Nothing was consumed, the caller is free to retry later.
+                    return false;
+                }
+                // Part of a line has been consumed already, so the rest has to arrive.
+                if ($iteration++ >= self::CONTROL_LINE_RETRIES) {
+                    throw new LogicException('Timeout reading protocol line');
+                }
+                $this->config->delay($iteration);
+                continue;
+            }
+
+            $line .= $chunk;
+
+            // A short chunk means the delimiter was reached and consumed.
+            if (strlen($chunk) < self::CONTROL_LINE_CHUNK) {
+                return $line;
+            }
+
+            if (strlen($line) > self::CONTROL_LINE_LIMIT) {
+                throw new LogicException(sprintf(
+                    'Protocol line exceeds the %d byte limit',
+                    self::CONTROL_LINE_LIMIT
+                ));
+            }
         }
     }
 
