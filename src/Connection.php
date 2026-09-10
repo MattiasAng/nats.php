@@ -436,9 +436,25 @@ class Connection
         $this->writeMessage(new Ping());
         $this->pingAt = microtime(true);
 
-        if (!$this->getMessage($this->config->timeout) instanceof Pong) {
-            throw new Exception('Handshake failed: no PONG received');
+        $threshold = microtime(true) + $this->config->timeout;
+
+        while (microtime(true) < $threshold) {
+            $message = $this->getMessage($this->config->timeout);
+
+            if ($message instanceof Pong) {
+                return;
+            }
+
+            if ($message === null) {
+                break;
+            }
+
+            // A server that has something to say about its cluster may do so before
+            // answering. That INFO has already been applied, so keep waiting for the
+            // reply rather than treating it as one.
         }
+
+        throw new Exception('Handshake failed: no PONG received');
     }
 
     /**
