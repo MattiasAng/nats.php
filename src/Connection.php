@@ -294,6 +294,9 @@ class Connection
             $this->sendMessage(new Subscribe([
                 'sid' => $subscription['sid'],
                 'subject' => $subscription['name'],
+                // Without the queue group a replayed subscription becomes a plain
+                // one, so every member of the group receives every message.
+                'group' => $subscription['group'] ?? null,
             ]));
         }
 

@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace Tests\Functional;
 
-use Basis\Nats\Client;
-use Basis\Nats\Configuration;
 use Basis\Nats\Connection;
 use LogicException;
+use Monolog\Handler\StreamHandler;
+use Monolog\Logger;
 use ReflectionMethod;
 use ReflectionProperty;
 use Tests\FunctionalTestCase;
@@ -95,5 +95,47 @@ class ConnectionRecoveryTest extends FunctionalTestCase
         $this->assertTrue($client->ping(), 'the protocol stream must still be in sync');
 
         $subscriber->disconnect();
+    }
+
+    /**
+     * The stored subscription used to keep only the subject and the sid, so the
+     * replayed SUB dropped its queue group. The subscriber then silently became a
+     * plain one and every member of the group received every message.
+     */
+    public function testQueueGroupSurvivesReconnect(): void
+    {
+        $client = $this->createClient();
+        $client->subscribeQueue('group.subject', 'workers', fn () => null);
+        $client->ping();
+
+        if (!$client->connection->logger) {
+            $client->connection->logger = new Logger('client');
+        }
+        assert($client->connection->logger instanceof Logger);
+        $client->connection->logger->pushHandler($spy = new class ('') extends StreamHandler {
+            public array $records = [];
+
+            protected function write(array $record): void
+            {
+                $this->records[] = $record['message'];
+            }
+        });
+
+        $socket = new ReflectionProperty(Connection::class, 'socket');
+        fclose($socket->getValue($client->connection));
+
+        $this->assertTrue($client->ping());
+
+        $replayed = array_values(array_filter(
+            $spy->records,
+            fn ($row) => str_contains($row, 'send SUB group.subject')
+        ));
+
+        $this->assertCount(1, $replayed, 'the subscription has to be replayed once');
+        $this->assertStringContainsString(
+            'SUB group.subject workers ',
+            $replayed[0],
+            'the replayed subscription has to keep its queue group'
+        );
     }
 }
