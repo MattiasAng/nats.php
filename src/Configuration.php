@@ -78,6 +78,10 @@ class Configuration
             'verbose' => $this->verbose,
             'version' => $this->version,
             'headers' => true,
+            // Protocol level 1 is what makes the server push asynchronous INFO
+            // updates, which is how cluster topology changes and lame duck mode
+            // are announced.
+            'protocol' => 1,
         ];
 
         if ($this->user !== null) {

@@ -8,7 +8,7 @@ use Basis\Nats\Client;
 use Basis\Nats\Configuration;
 use Basis\Nats\Connection;
 use Basis\Nats\Message\Info;
-use LogicException;
+use InvalidArgumentException;
 use ReflectionProperty;
 use Tests\TestCase;
 
@@ -56,11 +56,10 @@ class ConnectionReadLineTest extends TestCase
         $line = 'INFO ' . json_encode($info);
         $this->assertGreaterThan(1024, strlen($line), 'the fixture has to exceed one chunk');
 
-        $message = $this->readMessage($line . "\r\n");
+        $info = $this->readInfo($line . "\r\n");
 
-        $this->assertInstanceOf(Info::class, $message);
-        $this->assertSame($urls, $message->connect_urls);
-        $this->assertSame(1048576, $message->max_payload);
+        $this->assertSame($urls, $info->connect_urls);
+        $this->assertSame(1048576, $info->max_payload);
     }
 
     public function testLineOfExactlyOneChunkIsReadWhole(): void
@@ -73,10 +72,9 @@ class ConnectionReadLineTest extends TestCase
 
         $this->assertSame(1024, strlen($line));
 
-        $message = $this->readMessage($line . "\r\n");
+        $info = $this->readInfo($line . "\r\n");
 
-        $this->assertInstanceOf(Info::class, $message);
-        $this->assertSame($name, $message->server_name);
+        $this->assertSame($name, $info->server_name);
     }
 
     /**
@@ -85,13 +83,31 @@ class ConnectionReadLineTest extends TestCase
      */
     public function testDamagedLineIsRejected(): void
     {
-        $this->expectException(\InvalidArgumentException::class);
+        $connection = $this->connectionReading('INFO {"server_name":"cut-off' . "\r\n");
+
+        $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessage('Invalid payload for message');
 
-        $this->readMessage('INFO {"server_name":"cut-off' . "\r\n");
+        $connection->getMessage(0);
     }
 
-    private function readMessage(string $wire): ?object
+    /**
+     * Feeds a raw protocol line to a connection over a socket pair and returns the
+     * INFO state it ended up with. An asynchronous INFO is not handed back to
+     * callers, so the merged message is what there is to observe.
+     */
+    private function readInfo(string $wire): Info
+    {
+        $connection = $this->connectionReading($wire);
+
+        // A zero timeout consumes whatever is buffered and returns, so nothing has
+        // to be caught here and an unexpected failure is not swallowed.
+        $connection->getMessage(0);
+
+        return $connection->getInfoMessage();
+    }
+
+    private function connectionReading(string $wire): Connection
     {
         [$clientEnd, $serverEnd] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
         $this->sockets[] = $clientEnd;
@@ -103,6 +119,6 @@ class ConnectionReadLineTest extends TestCase
         $property = new ReflectionProperty(Connection::class, 'socket');
         $property->setValue($client->connection, $clientEnd);
 
-        return $client->connection->getMessage(1);
+        return $client->connection;
     }
 }

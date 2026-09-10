@@ -38,9 +38,23 @@ abstract class Prototype
 
         foreach ($values as $k => $v) {
             if (!property_exists($this, $k)) {
+                if ($this->ignoresUnknownProperties()) {
+                    continue;
+                }
+
                 throw new InvalidArgumentException("Invalid property $k for message " . get_class($this));
             }
             $this->$k = $v;
         }
+    }
+
+    /**
+     * Whether a field this message does not declare is ignored rather than
+     * rejected. Strict by default, since the client authors those messages itself
+     * and a stray field means a mistake.
+     */
+    protected function ignoresUnknownProperties(): bool
+    {
+        return false;
     }
 }

@@ -181,7 +181,17 @@ class Connection
                         }
                     }
                     $this->processInfo($message);
-                    return $message;
+
+                    // Only the handshake is waiting for an INFO. Every later one is
+                    // an asynchronous topology update that the client acts on
+                    // itself, so returning it would hand application code a message
+                    // it never asked for, and would consume the read that the caller
+                    // meant for its own reply.
+                    if ($this->connecting) {
+                        return $message;
+                    }
+
+                    continue;
                 }
             } elseif ($this->activityAt && $this->activityAt + $this->config->timeout < $now) {
                 if ($this->pingAt && $this->pingAt + $this->config->pingInterval < $now) {
