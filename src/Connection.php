@@ -16,6 +16,7 @@ use Basis\Nats\Message\Publish;
 use Basis\Nats\Message\Pong;
 use Basis\Nats\Message\Prototype as Message;
 use Basis\Nats\Message\Subscribe;
+use Closure;
 use LogicException;
 use Psr\Log\LoggerInterface;
 use Throwable;
@@ -41,6 +42,9 @@ class Connection
 
     /** Guards the handshake against re-entering the reconnect loop. */
     private bool $connecting = false;
+
+    /** Set by forceReconnect(), acted on at the next read or write. */
+    private bool $reconnectRequested = false;
 
     private float $activityAt = 0;
     private float $pingAt = 0;
@@ -104,6 +108,8 @@ class Connection
         if ($timeout === null) {
             $timeout = $this->config->timeout;
         }
+
+        $this->applyRequestedReconnect();
 
         $now = microtime(true);
         $max = $timeout > 0 ? $now + $timeout : PHP_FLOAT_MAX;
@@ -228,6 +234,7 @@ class Connection
     public function sendMessage(Message $message): void
     {
         $this->init();
+        $this->applyRequestedReconnect();
 
         while (true) {
             try {
@@ -541,7 +548,79 @@ class Connection
             $this->mergeInfoMessage($info);
         }
 
-        $this->getPool()->processInfo($info, $this->connecting);
+        $pool = $this->getPool();
+        $update = $pool->processInfo($info, $this->connecting);
+
+        // The INFO that opens a connection fills the pool silently, so a client that
+        // starts up against an assembled cluster is not told about a discovery it
+        // never made, and a server already draining is not announced as having just
+        // started to. Both match the go and python clients.
+        if ($this->connecting) {
+            return;
+        }
+
+        if ($update->hasNew) {
+            $this->invokeHandler($this->config->discoveredServersHandler);
+        }
+
+        $server = $pool->current();
+
+        // Edge triggered: the flag is repeated on every update that follows, and the
+        // handler is meant to hear about the transition once.
+        if (($info->ldm ?? false) && $server !== null && !$server->draining) {
+            $server->draining = true;
+            $this->logger?->info('server entered lame duck mode: ' . $server->getAddress());
+            $this->invokeHandler($this->config->lameDuckModeHandler);
+        }
+    }
+
+    /**
+     * Runs a configured handler.
+     *
+     * A synchronous client has no callback loop to hand these to, so they run inline
+     * on the read that delivered the update. A handler that throws must not take
+     * down the connection that was reading.
+     */
+    private function invokeHandler(?Closure $handler): void
+    {
+        if ($handler === null) {
+            return;
+        }
+
+        try {
+            $handler($this->client);
+        } catch (Throwable $e) {
+            $this->logger?->error('handler failed: ' . $e->getMessage(), ['exception' => $e]);
+        }
+    }
+
+    /**
+     * Asks for the connection to be moved to another server.
+     *
+     * Deferred to the next read or write rather than done here, because the way to
+     * migrate off a draining server is to call this from the lame duck handler,
+     * which runs inside the read that delivered the notification. Reconnecting from
+     * there would tear down the call stack still processing that message.
+     */
+    public function forceReconnect(): void
+    {
+        $this->reconnectRequested = true;
+    }
+
+    private function applyRequestedReconnect(): void
+    {
+        if (!$this->reconnectRequested || $this->connecting) {
+            return;
+        }
+
+        $this->reconnectRequested = false;
+
+        // Nothing to move off yet: the next connection picks a server regardless.
+        if (!is_resource($this->socket)) {
+            return;
+        }
+
+        $this->processException(new LogicException('Reconnect requested'));
     }
 
     /**
