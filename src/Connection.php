@@ -325,6 +325,12 @@ class Connection
                 $failure = $error;
                 $pool->markFailed($server, $error);
 
+                // Which member failed and why, so a sweep of the pool reads as the
+                // sequence of attempts it actually was.
+                $this->logger?->debug(
+                    'connection to ' . $server->getAddress() . ' failed: ' . $error->getMessage()
+                );
+
                 // Rejected credentials will not start working on their own, so a
                 // server failing that way twice running is dropped rather than
                 // retried around the pool forever.
@@ -417,6 +423,10 @@ class Connection
         $this->verifyConnection();
 
         $this->getPool()->markConnected($server);
+
+        // Which member of the pool this connection actually landed on, which is the
+        // first thing worth knowing when reading back a failover.
+        $this->logger?->debug('connected to ' . $server->getAddress());
 
         $this->restoreSubscriptions();
     }
@@ -617,6 +627,10 @@ class Connection
      * migrate off a draining server is to call this from the lame duck handler,
      * which runs inside the read that delivered the notification. Reconnecting from
      * there would tear down the call stack still processing that message.
+     *
+     * Applies whatever the reconnect option says, that one governing whether the
+     * client recovers on its own rather than whether it does as it is told. If no
+     * server can be reached, the failure raised is the connection error itself.
      */
     public function forceReconnect(): void
     {
@@ -636,7 +650,18 @@ class Connection
             return;
         }
 
-        $this->processException(new LogicException('Reconnect requested'));
+        $this->logger?->debug(
+            'reconnecting on request, leaving ' . $this->getPool()->current()?->getAddress()
+        );
+
+        // Deliberately not routed through processException(): this is a requested
+        // operation rather than a failure. Handing it a synthetic exception logged
+        // an error for an ordinary event, refused to run at all when automatic
+        // reconnection was disabled, and, once the pool was exhausted, reported
+        // that synthetic exception as the cause in place of the connection errors
+        // that actually stopped it.
+        $this->getPool()->next();
+        $this->connect(retry: true);
     }
 
     /**

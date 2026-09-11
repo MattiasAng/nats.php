@@ -8,7 +8,7 @@ use Basis\Nats\Configuration;
 use Basis\Nats\Message\Info;
 use Closure;
 use InvalidArgumentException;
-use LogicException;
+use RuntimeException;
 use Throwable;
 
 /**
@@ -86,7 +86,7 @@ class ServerPool
         $index = $this->indexOfCurrent();
 
         if ($index === null) {
-            throw new LogicException('No servers available');
+            throw new RuntimeException('No servers available');
         }
 
         $server = $this->servers[$index];
@@ -99,7 +99,7 @@ class ServerPool
 
         if ($this->servers === []) {
             $this->current = null;
-            throw new LogicException('No servers available');
+            throw new RuntimeException('No servers available');
         }
 
         return $this->current = $this->servers[0];

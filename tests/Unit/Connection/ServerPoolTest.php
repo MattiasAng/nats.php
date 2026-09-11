@@ -8,7 +8,6 @@ use Basis\Nats\Configuration;
 use Basis\Nats\Connection\Server;
 use Basis\Nats\Connection\ServerPool;
 use Basis\Nats\Message\Info;
-use LogicException;
 use RuntimeException;
 use Tests\TestCase;
 
@@ -307,7 +306,9 @@ class ServerPoolTest extends TestCase
 
         $pool->markFailed($pool->current(), new RuntimeException('down'));
 
-        $this->expectException(LogicException::class);
+        // Whether a server can be reached is external state, so running out of them
+        // is a runtime condition rather than a mistake in the calling code.
+        $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('No servers available');
         $pool->next();
     }
