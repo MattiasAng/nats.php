@@ -65,7 +65,8 @@ it has to reconnect, so one unreachable member does not take the client down.
 
 Entries may be bare `host:port`, or full urls carrying a scheme and credentials:
 `nats://user:secret@host:4222`, `tls://host:4222`. A user name with no password
-is treated as a token. When `servers` is set, `host` and `port` are ignored.
+is treated as a token. Credentials are percent-decoded, so write a password containing
+`@`, `:`, `/`, `#` or `%` encoded (`p%40ss` for `p@ss`). When `servers` is set, `host` and `port` are ignored.
 
 ```php
 use Basis\Nats\Client;

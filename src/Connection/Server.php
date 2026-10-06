@@ -53,11 +53,14 @@ class Server
         $parts = parse_url($normalized);
 
         if ($parts === false || !isset($parts['host']) || $parts['host'] === '') {
-            throw new InvalidArgumentException("Invalid server url: $url");
+            throw new InvalidArgumentException('Invalid server url: ' . self::withoutCredentials($url));
         }
 
-        $user = $parts['user'] ?? null;
-        $pass = $parts['pass'] ?? null;
+        // parse_url leaves the credentials percent-encoded, and the characters that
+        // delimit a url can only appear in them that way, so a password containing
+        // one would otherwise be sent to the server encoded.
+        $user = isset($parts['user']) ? rawurldecode($parts['user']) : null;
+        $pass = isset($parts['pass']) ? rawurldecode($parts['pass']) : null;
         $token = null;
 
         // A username with no password is a token, the same rule the go client uses.
@@ -111,6 +114,25 @@ class Server
     public function getTlsPeerName(): string
     {
         return $this->tlsName ?? $this->host;
+    }
+
+    /**
+     * Hides the userinfo of a url that is about to be quoted in an error message.
+     * Cut at the last @, since an unencoded one in the password is the typical reason
+     * such a url fails to parse.
+     */
+    private static function withoutCredentials(string $url): string
+    {
+        $at = strrpos($url, '@');
+
+        if ($at === false) {
+            return $url;
+        }
+
+        $scheme = strpos($url, '://');
+        $prefix = $scheme !== false && $scheme < $at ? substr($url, 0, $scheme + 3) : '';
+
+        return $prefix . '***@' . substr($url, $at + 1);
     }
 
     /** Strips the brackets parse_url keeps around an ipv6 literal. */

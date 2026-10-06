@@ -46,6 +46,41 @@ class ServerTest extends TestCase
     }
 
     /**
+     * The characters that delimit a url have to be percent-encoded to appear in its
+     * credentials at all, so what reaches the server must be the decoded value.
+     */
+    public function testCredentialsArePercentDecoded()
+    {
+        $server = Server::fromUrl('nats://us%40er:p%40ss%3Aw%2Ford%23%25@localhost:4222');
+
+        $this->assertSame('us@er', $server->user);
+        $this->assertSame('p@ss:w/ord#%', $server->pass);
+    }
+
+    public function testTokenIsPercentDecoded()
+    {
+        $server = Server::fromUrl('nats://t%40k%2Fn@localhost:4222');
+
+        $this->assertSame('t@k/n', $server->token);
+    }
+
+    /**
+     * An entry that cannot be parsed ends up in the application's logs, and the
+     * password in it must not.
+     */
+    public function testInvalidUrlDoesNotRevealItsCredentials()
+    {
+        try {
+            Server::fromUrl('nats://user:p@ss@:4222');
+            $this->fail('the url has no host');
+        } catch (InvalidArgumentException $e) {
+            $this->assertStringContainsString('Invalid server url', $e->getMessage());
+            $this->assertStringNotContainsString('p@ss', $e->getMessage());
+            $this->assertStringNotContainsString('user', $e->getMessage());
+        }
+    }
+
+    /**
      * A username with no password is a token, the rule the go client uses.
      */
     public function testUsernameWithoutPasswordIsAToken()
