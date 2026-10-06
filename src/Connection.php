@@ -322,6 +322,11 @@ class Connection
                 $failure = $error;
                 $pool->markFailed($server, $error);
 
+                // A socket that opened but never finished its handshake has no
+                // subscriptions and has not sent CONNECT. Left assigned, init() would
+                // take it for a live connection and the next write would use it.
+                $this->closeSocket();
+
                 // Which member failed and why, so a sweep of the pool reads as the
                 // sequence of attempts it actually was.
                 $this->logger?->debug(
