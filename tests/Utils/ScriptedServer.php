@@ -1,0 +1,73 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Tests\Utils;
+
+use RuntimeException;
+
+/**
+ * A server that plays a fixed script to the one client that connects to it, for
+ * tests that need to control the exact order of protocol lines. It runs in a child
+ * process because a single process cannot be both the client waiting on a read and
+ * the server that has to answer it.
+ */
+final class ScriptedServer
+{
+    /** @var resource */
+    private $process;
+
+    /** @var resource */
+    private $output;
+
+    private function __construct(
+        $process,
+        $output,
+        public readonly string $address,
+    ) {
+        $this->process = $process;
+        $this->output = $output;
+    }
+
+    /**
+     * @param array $steps ["send", bytes], ["read"] (one line from the client) or
+     *                     ["sleep", seconds]
+     */
+    public static function start(array $steps): self
+    {
+        $command = [PHP_BINARY, '-n', __DIR__ . '/scripted-server.php', json_encode($steps)];
+        $process = proc_open($command, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+
+        if (!is_resource($process)) {
+            throw new RuntimeException('Could not start the scripted server');
+        }
+
+        stream_set_timeout($pipes[1], 5);
+        $address = fgets($pipes[1]);
+
+        if ($address === false) {
+            throw new RuntimeException('The scripted server did not report its address');
+        }
+
+        return new self($process, $pipes[1], trim($address));
+    }
+
+    /**
+     * Waits for the script to run out and returns the lines the client sent, with
+     * null for a read that got nothing.
+     *
+     * @return array<int, string|null>
+     */
+    public function finish(): array
+    {
+        $lines = [];
+        while (($line = fgets($this->output)) !== false) {
+            $lines[] = trim($line);
+        }
+
+        fclose($this->output);
+        proc_close($this->process);
+
+        return json_decode((string) end($lines), true) ?? [];
+    }
+}

@@ -89,6 +89,28 @@ class ServerPoolTest extends TestCase
         $this->assertSame(['nats://a:4222', 'nats://b:4222', 'nats://c:4222'], $pool->getServers());
     }
 
+    /**
+     * The scheme of the server that advertised an address is not the whole story: an
+     * entry written as nats:// may still have been reached over TLS.
+     */
+    public function testServersAdvertisedOverAnEncryptedConnectionRequireTls()
+    {
+        $pool = $this->pool(['servers' => ['nats://a:4222']]);
+
+        $pool->processInfo($this->info(['connect_urls' => ['b:4222']]), true);
+
+        $this->assertSame(['tls://b:4222'], $pool->getDiscoveredServers());
+    }
+
+    public function testServersAdvertisedOverAPlainConnectionAreNotUpgraded()
+    {
+        $pool = $this->pool(['servers' => ['nats://a:4222']]);
+
+        $pool->processInfo($this->info(['connect_urls' => ['b:4222']]), false);
+
+        $this->assertSame(['nats://b:4222'], $pool->getDiscoveredServers());
+    }
+
     public function testDiscoversAdvertisedServers()
     {
         $pool = $this->pool(['servers' => ['a:4222']]);

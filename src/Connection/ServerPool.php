@@ -140,10 +140,10 @@ class ServerPool
     /**
      * Applies the cluster topology from an INFO message.
      *
-     * @param bool $initial true while the connection is still being established,
-     *                      when the pool is populated silently
+     * @param bool $encrypted whether the connection the INFO arrived on is encrypted,
+     *                        in which case every server it advertises has to be too
      */
-    public function processInfo(Info $info, bool $initial = false): PoolUpdate
+    public function processInfo(Info $info, bool $encrypted = false): PoolUpdate
     {
         $advertised = $info->connect_urls ?? [];
 
@@ -188,7 +188,7 @@ class ServerPool
         $hasNew = false;
 
         foreach (array_keys($unmatched) as $address) {
-            $server = $this->discover($address, $inheritTlsName);
+            $server = $this->discover($address, $inheritTlsName, $encrypted);
 
             if ($server === null) {
                 continue;
@@ -231,8 +231,12 @@ class ServerPool
      * credentials of the server that told us about it, since connect_urls carries
      * neither. A malformed address is skipped rather than fatal, matching the go
      * client.
+     *
+     * Encryption is inherited as a requirement: a server that was reached over TLS
+     * cannot send the client, and its credentials, to an advertised address that
+     * then answers in cleartext.
      */
-    private function discover(string $address, bool $inheritTlsName): ?Server
+    private function discover(string $address, bool $inheritTlsName, bool $encrypted): ?Server
     {
         $current = $this->current;
 
@@ -245,7 +249,7 @@ class ServerPool
         return new Server(
             host: $server->host,
             port: $server->port,
-            secure: $current?->secure ?? false,
+            secure: $encrypted || ($current?->secure ?? false),
             isImplicit: true,
             // A cluster advertises addresses, so a certificate issued for the name we
             // were configured with cannot be verified against them.

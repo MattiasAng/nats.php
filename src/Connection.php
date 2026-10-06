@@ -426,6 +426,13 @@ class Connection
         }
         $this->infoMessage = $infoMessage;
 
+        // Decided by what the server's INFO asked for, which is the one thing a
+        // network attacker can edit, so a tls:// entry cannot rely on it alone. The
+        // credentials are in the CONNECT that follows.
+        if ($server->secure && !$this->tlsEnabled) {
+            throw new Exception('TLS is required for ' . $server->getUrl() . ' but the connection is not encrypted');
+        }
+
         if (isset($this->infoMessage->nonce) && $this->authenticator) {
             $this->connectMessage->sig = $this->authenticator->sign($this->infoMessage->nonce);
             $this->connectMessage->nkey = $this->authenticator->getPublicKey();
@@ -591,7 +598,7 @@ class Connection
         }
 
         $pool = $this->getPool();
-        $update = $pool->processInfo($info, $this->connecting);
+        $update = $pool->processInfo($info, $this->tlsEnabled);
 
         // The INFO that opens a connection fills the pool silently, so a client that
         // starts up against an assembled cluster is not told about a discovery it

@@ -111,10 +111,15 @@ $configuration = new Configuration(
 ```
 
 Credentials are not advertised, so a discovered server is reached with those of
-the server that advertised it. A certificate cannot be verified against an
-advertised address either, so when the configured host is a name and the
-advertised member is an ip address, that name is what the certificate is checked
-against.
+the server that advertised it. A server advertised over an encrypted connection
+is required to be encrypted as well: the client refuses to send its credentials
+to it otherwise. A `tls://` entry in `servers` is held to the same rule, and
+fails the connection instead of sending a cleartext CONNECT when the server does
+not negotiate TLS.
+
+The certificate is checked against `tlsCaFile`, not against the host name, for
+configured and discovered servers alike. Without `tlsCaFile` it is not checked at
+all.
 
 #### Lame duck mode
 
