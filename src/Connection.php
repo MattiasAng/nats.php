@@ -230,8 +230,10 @@ class Connection
 
     public function sendMessage(Message $message): void
     {
-        $this->init();
+        // Before init(), so that a request made while there is no connection is
+        // answered by the connection init() is about to make, not by a second one.
         $this->applyRequestedReconnect();
+        $this->init();
 
         while (true) {
             try {

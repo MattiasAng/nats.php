@@ -32,10 +32,13 @@ final class ScriptedServer
     /**
      * @param array $steps ["send", bytes], ["read"] (one line from the client) or
      *                     ["sleep", seconds]
+     * @param int $connections how many clients get the script, one after another.
+     *                         The listener is closed after the last one, so a further
+     *                         attempt is refused.
      */
-    public static function start(array $steps): self
+    public static function start(array $steps, int $connections = 1): self
     {
-        $command = [PHP_BINARY, '-n', __DIR__ . '/scripted-server.php', json_encode($steps)];
+        $command = [PHP_BINARY, '-n', __DIR__ . '/scripted-server.php', json_encode($steps), (string) $connections];
         $process = proc_open($command, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
 
         if (!is_resource($process)) {
@@ -53,8 +56,8 @@ final class ScriptedServer
     }
 
     /**
-     * Waits for the script to run out and returns the lines the client sent, with
-     * null for a read that got nothing.
+     * Waits for the script to run out and returns the lines the client sent, in
+     * order across connections, with null for a read that got nothing.
      *
      * @return array<int, string|null>
      */

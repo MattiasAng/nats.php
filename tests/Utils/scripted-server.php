@@ -1,8 +1,9 @@
 <?php
 
 /**
- * Child process of ScriptedServer: listens on an ephemeral port, accepts one client
- * and plays the script it was given, then prints the lines it read as json.
+ * Child process of ScriptedServer: listens on an ephemeral port, accepts the given
+ * number of clients one after another, plays the script it was given to each, then
+ * prints the lines it read as json.
  *
  * Steps: ["send", bytes], ["read"], ["sleep", seconds].
  */
@@ -10,6 +11,7 @@
 declare(strict_types=1);
 
 $steps = json_decode($argv[1], true, 512, JSON_THROW_ON_ERROR);
+$connections = (int) $argv[2];
 
 $server = stream_socket_server('tcp://127.0.0.1:0', $errno, $error);
 if ($server === false) {
@@ -20,10 +22,15 @@ if ($server === false) {
 fwrite(STDOUT, stream_socket_get_name($server, false) . "\n");
 fflush(STDOUT);
 
-$connection = @stream_socket_accept($server, 5);
 $read = [];
 
-if ($connection !== false) {
+for ($i = 0; $i < $connections; $i++) {
+    $connection = @stream_socket_accept($server, 5);
+
+    if ($connection === false) {
+        break;
+    }
+
     stream_set_timeout($connection, 1);
 
     foreach ($steps as $step) {
@@ -40,4 +47,5 @@ if ($connection !== false) {
     fclose($connection);
 }
 
+fclose($server);
 fwrite(STDOUT, json_encode($read) . "\n");
