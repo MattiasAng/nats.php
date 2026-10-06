@@ -8,7 +8,9 @@ use Basis\Nats\Client;
 use Basis\Nats\Configuration;
 use Basis\Nats\Connection;
 use Basis\Nats\Message\Info;
+use Basis\Nats\Message\Pong;
 use InvalidArgumentException;
+use LogicException;
 use ReflectionProperty;
 use Tests\TestCase;
 
@@ -92,6 +94,68 @@ class ConnectionReadLineTest extends TestCase
     }
 
     /**
+     * One byte short of a chunk puts the carriage return in the last byte of the read
+     * window and the line feed outside it, so the delimiter is not recognised and
+     * the next protocol line used to be glued onto this one.
+     *
+     * @dataProvider lengthsAroundAChunkBoundary
+     */
+    public function testLineEndingAtAChunkBoundaryDoesNotSwallowTheNextLine(int $length): void
+    {
+        $prefix = 'INFO {"server_name":"';
+        $suffix = '","proto":1}';
+        $name = str_repeat('x', $length - strlen($prefix) - strlen($suffix));
+        $line = $prefix . $name . $suffix;
+
+        $this->assertSame($length, strlen($line));
+
+        $connection = $this->connectionReading($line . "\r\nPONG\r\n");
+
+        $this->assertInstanceOf(Pong::class, $connection->getMessage(1));
+        $this->assertSame($name, $connection->getInfoMessage()->server_name);
+    }
+
+    public static function lengthsAroundAChunkBoundary(): array
+    {
+        return [
+            'one short of a chunk' => [1023],
+            'one chunk' => [1024],
+            'one over a chunk' => [1025],
+            'one short of two chunks' => [2047],
+        ];
+    }
+
+    /**
+     * A line that has only partly arrived is left where it is, so that the rest can
+     * complete it later, instead of being consumed and left half read.
+     */
+    public function testPartialLineIsCompletedByALaterRead(): void
+    {
+        $connection = $this->connectionReading('INFO {"server_name":"par');
+
+        $this->assertNull($connection->getMessage(0));
+
+        fwrite($this->sockets[1], "tial\"}\r\nPONG\r\n");
+
+        $this->assertInstanceOf(Pong::class, $connection->getMessage(1));
+        $this->assertSame('partial', $connection->getInfoMessage()->server_name);
+    }
+
+    /**
+     * A peer that hung up is readable too, with nothing to read, which must still end
+     * in the disconnect being handled rather than in an empty poll.
+     */
+    public function testClosedPeerIsStillReportedByANonBlockingRead(): void
+    {
+        $connection = $this->connectionReading('');
+        fclose($this->sockets[1]);
+
+        $this->expectException(LogicException::class);
+
+        $connection->getMessage(0);
+    }
+
+    /**
      * Feeds a raw protocol line to a connection over a socket pair and returns the
      * INFO state it ended up with. An asynchronous INFO is not handed back to
      * callers, so the merged message is what there is to observe.
@@ -113,6 +177,7 @@ class ConnectionReadLineTest extends TestCase
         $this->sockets[] = $clientEnd;
         $this->sockets[] = $serverEnd;
 
+        stream_set_timeout($clientEnd, 0, 200_000);
         fwrite($serverEnd, $wire);
 
         $client = new Client(new Configuration(['reconnect' => false, 'timeout' => 1]));

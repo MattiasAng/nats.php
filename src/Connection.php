@@ -24,18 +24,8 @@ use Exception;
 
 class Connection
 {
-    /**
-     * Unit of a single protocol line read. stream_get_line() stops after this many
-     * bytes without consuming the delimiter, so readLine() keeps reading until a
-     * short chunk comes back.
-     */
-    private const CONTROL_LINE_CHUNK = 1024;
-
     /** Refuse to buffer a single protocol line larger than this. */
     private const CONTROL_LINE_LIMIT = 1_048_576;
-
-    /** How many times to wait for the rest of a partially consumed protocol line. */
-    private const CONTROL_LINE_RETRIES = 16;
 
     private $socket;
     private $context;
@@ -157,6 +147,13 @@ class Connection
             $message = null;
             $line = $this->readLine();
             $now = microtime(true);
+
+            if ($line === false && $timeout === 0 && !feof($this->socket)) {
+                // Only part of a line has arrived. It stays buffered, so selecting
+                // again would report it readable and spin until the rest comes. A
+                // closed socket is left to the check at the top of the loop.
+                break;
+            }
             if ($line) {
                 $message = Factory::create($line);
                 $this->activityAt = $now;
@@ -710,50 +707,31 @@ class Connection
     /**
      * Reads a single protocol control line.
      *
-     * A clustered INFO carrying many connect_urls comfortably exceeds one chunk.
-     * stream_get_line() returns exactly the chunk size in that case and leaves the
-     * delimiter unconsumed, handing back the remainder of the same line on the next
-     * call as though it were a new protocol line. Reading a truncated INFO leaves the
-     * json_decode in Payload returning null, which Prototype used to swallow, and the
-     * leftovers then reach Factory as garbage.
+     * Asks for the whole line in one call. stream_get_line() only recognises a
+     * delimiter that lies inside the window it was given, so a smaller window splits
+     * a line whose carriage return is the last byte of it, and a clustered INFO
+     * carrying many connect_urls reaches such lengths. When the line has not fully
+     * arrived the call returns false without consuming it, so the rest can complete
+     * it on a later read.
      *
-     * @return string|false false when nothing was read at all
+     * @return string|false false when there is no complete line yet
      */
     private function readLine(): string|false
     {
-        $line = '';
-        $iteration = 0;
+        $line = stream_get_line($this->socket, self::CONTROL_LINE_LIMIT, "\r\n");
 
-        while (true) {
-            $chunk = stream_get_line($this->socket, self::CONTROL_LINE_CHUNK, "\r\n");
+        if ($line !== false && strlen($line) >= self::CONTROL_LINE_LIMIT) {
+            // What is left of the line cannot be told from the start of the next one,
+            // so the connection is dropped and the next read reconnects.
+            $this->closeSocket();
 
-            if ($chunk === false) {
-                if ($line === '') {
-                    // Nothing was consumed, the caller is free to retry later.
-                    return false;
-                }
-                // Part of a line has been consumed already, so the rest has to arrive.
-                if ($iteration++ >= self::CONTROL_LINE_RETRIES) {
-                    throw new LogicException('Timeout reading protocol line');
-                }
-                $this->config->delay($iteration);
-                continue;
-            }
-
-            $line .= $chunk;
-
-            // A short chunk means the delimiter was reached and consumed.
-            if (strlen($chunk) < self::CONTROL_LINE_CHUNK) {
-                return $line;
-            }
-
-            if (strlen($line) > self::CONTROL_LINE_LIMIT) {
-                throw new LogicException(sprintf(
-                    'Protocol line exceeds the %d byte limit',
-                    self::CONTROL_LINE_LIMIT
-                ));
-            }
+            throw new LogicException(sprintf(
+                'Protocol line exceeds the %d byte limit',
+                self::CONTROL_LINE_LIMIT
+            ));
         }
+
+        return $line;
     }
 
     protected function getPayload(int $length): string
