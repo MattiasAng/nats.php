@@ -291,6 +291,15 @@ class Connection
     private function connect(bool $retry): void
     {
         $pool = $this->getPool();
+
+        // A pool the previous attempt used up ended that attempt, not the client.
+        // Without this every later call would fail at once, and a long running
+        // worker that catches the error and carries on would never recover.
+        if ($pool->current() === null) {
+            $this->logger?->warning('no servers left in the pool, rebuilding it from the configuration');
+            $pool = $this->pool = new ServerPool($this->config);
+        }
+
         $remaining = $pool->count();
         $failure = null;
 
@@ -338,6 +347,9 @@ class Connection
                 // retried around the pool forever.
                 if ($this->isAuthenticationFailure($error)) {
                     if ($server->authenticationFailed) {
+                        $this->logger?->warning(
+                            'dropping ' . $server->getAddress() . ' after repeated authentication failures'
+                        );
                         $pool->evict($server);
                     }
                     $server->authenticationFailed = true;
