@@ -397,8 +397,7 @@ class Connection
             $this->enableTls(true);
         }
 
-        $this->connectMessage = new Connect($config->getOptions());
-        $this->applyCredentials($server, $this->connectMessage);
+        $this->connectMessage = new Connect($this->applyCredentials($server, $config->getOptions()));
 
         if ($this->client->getName()) {
             $this->connectMessage->name = $this->client->getName();
@@ -472,26 +471,29 @@ class Connection
      * the precedence the go client uses, and the three forms stay mutually
      * exclusive. nkey and jwt are untouched: they are signed per connection from the
      * nonce in that server's INFO, so they already apply to every server.
+     *
+     * Applied to the options rather than to the Connect message, so that a field
+     * which must not be sent is never set instead of being unset afterwards.
      */
-    private function applyCredentials(Server $server, Connect $message): void
+    private function applyCredentials(Server $server, array $options): array
     {
         if ($server->token !== null) {
-            unset($message->user, $message->pass);
-            $message->auth_token = $server->token;
+            unset($options['user'], $options['pass']);
+            $options['auth_token'] = $server->token;
 
-            return;
+            return $options;
         }
 
         if ($server->user !== null) {
-            unset($message->auth_token);
-            $message->user = $server->user;
+            unset($options['auth_token'], $options['pass']);
+            $options['user'] = $server->user;
 
             if ($server->pass !== null) {
-                $message->pass = $server->pass;
-            } else {
-                unset($message->pass);
+                $options['pass'] = $server->pass;
             }
         }
+
+        return $options;
     }
 
     private function resetConnectionState(): void
