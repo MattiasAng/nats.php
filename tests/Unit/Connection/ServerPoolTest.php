@@ -309,6 +309,53 @@ class ServerPoolTest extends TestCase
         $this->assertSame(['nats://b:4222'], $pool->getServers());
     }
 
+    public function testEvictingAnotherServerKeepsTheCurrentOne()
+    {
+        $pool = $this->pool(['servers' => ['a:4222', 'b:4222', 'c:4222']]);
+        $a = $pool->current();
+        $b = $pool->next();
+
+        $pool->evict($a);
+
+        $this->assertSame($b, $pool->current());
+        $this->assertSame(['nats://b:4222', 'nats://c:4222'], $pool->getServers());
+    }
+
+    /**
+     * What a failed connection leaves as the current server is gone, so the pool has
+     * to hand out the next one rather than the one it just dropped.
+     */
+    public function testEvictingTheCurrentServerMovesOnToTheNextOne()
+    {
+        $pool = $this->pool(['servers' => ['a:4222', 'b:4222']]);
+
+        $pool->evict($pool->current());
+
+        $this->assertSame('b', $pool->current()->host);
+        $this->assertSame(['nats://b:4222'], $pool->getServers());
+    }
+
+    public function testEvictingTheLastServerEmptiesThePool()
+    {
+        $pool = $this->pool(['servers' => ['a:4222']]);
+
+        $pool->evict($pool->current());
+
+        $this->assertNull($pool->current());
+        $this->assertSame(0, $pool->count());
+        $this->assertSame([], $pool->getServers());
+    }
+
+    public function testEvictingAServerThatIsNotInThePoolChangesNothing()
+    {
+        $pool = $this->pool(['servers' => ['a:4222']]);
+
+        $pool->evict(new Server(host: 'elsewhere', port: 4222));
+
+        $this->assertSame(['nats://a:4222'], $pool->getServers());
+        $this->assertSame('a', $pool->current()->host);
+    }
+
     public function testUnlimitedBudgetNeverEvicts()
     {
         $pool = $this->pool(['servers' => ['a:4222'], 'maxReconnectAttempts' => -1]);

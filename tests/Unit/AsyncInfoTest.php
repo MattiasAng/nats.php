@@ -7,6 +7,7 @@ namespace Tests\Unit;
 use Basis\Nats\Client;
 use Basis\Nats\Configuration;
 use Basis\Nats\Connection;
+use Basis\Nats\Message\Pong;
 use ReflectionProperty;
 use Tests\TestCase;
 
@@ -164,6 +165,41 @@ class AsyncInfoTest extends TestCase
         $this->deliver($client, ['ldm' => true, 'connect_urls' => ['b.example.com:4222']]);
 
         $this->assertSame(1, $calls);
+    }
+
+    /**
+     * Only the handshake waits for an INFO. A later one is handled by the client, so
+     * the read that the caller made for its own reply must not be spent on it.
+     */
+    public function testAsynchronousInfoIsNotHandedToTheCaller(): void
+    {
+        $client = $this->client([]);
+        $this->attach($client, "INFO {\"connect_urls\":[\"b:4222\"]}\r\nPONG\r\n");
+
+        $message = $client->connection->getMessage(1);
+
+        $this->assertInstanceOf(Pong::class, $message);
+        $this->assertSame(['nats://b:4222'], $client->connection->getDiscoveredServers());
+    }
+
+    public function testAsynchronousInfoAloneLeavesTheCallerWithNothing(): void
+    {
+        $client = $this->client([]);
+        $this->attach($client, "INFO {\"connect_urls\":[\"b:4222\"]}\r\n");
+
+        $this->assertNull($client->connection->getMessage(0));
+        $this->assertSame(['nats://b:4222'], $client->connection->getDiscoveredServers());
+    }
+
+    private function attach(Client $client, string $wire): void
+    {
+        [$clientEnd, $serverEnd] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+        $this->sockets[] = $clientEnd;
+        $this->sockets[] = $serverEnd;
+
+        fwrite($serverEnd, $wire);
+
+        (new ReflectionProperty(Connection::class, 'socket'))->setValue($client->connection, $clientEnd);
     }
 
     private function client(array $options): Client
